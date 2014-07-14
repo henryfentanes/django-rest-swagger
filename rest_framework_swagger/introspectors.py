@@ -136,6 +136,7 @@ class BaseMethodIntrospector(object):
         body_params = self.build_body_parameters()
         form_params = self.build_form_parameters()
         query_params = self.build_query_params_from_docstring()
+        header_params = self.build_header_params_from_docstring()
 
         if path_params:
             params += path_params
@@ -148,6 +149,9 @@ class BaseMethodIntrospector(object):
 
         if query_params:
             params += query_params
+
+        if header_params:
+            params += header_params
 
         return params
 
@@ -256,6 +260,29 @@ class BaseMethodIntrospector(object):
             param = line.split(' -- ')
             if len(param) == 2:
                 params.append({'paramType': 'query',
+                               'name': param[0].strip(),
+                               'description': param[1].strip(),
+                               'dataType': ''})
+
+        return params
+
+    def build_header_params_from_docstring(self):
+        params = []
+
+        docstring = self.retrieve_docstring()
+        if docstring is None:
+            docstring = ''
+        docstring += "\n" + get_view_description(self.callback)
+
+        if docstring is None:
+            return params
+
+        split_lines = docstring.split('\n')
+
+        for line in split_lines:
+            param = line.split(' :: ')
+            if len(param) == 2:
+                params.append({'paramType': 'header',
                                'name': param[0].strip(),
                                'description': param[1].strip(),
                                'dataType': ''})
