@@ -119,7 +119,7 @@ class BaseMethodIntrospector(object):
         if class_docs is not None:
             docstring += class_docs
         if method_docs is not None:
-            docstring += '\n' + method_docs
+            docstring += '\n\n' + method_docs
 
         # docstring = IntrospectorHelper.strip_params_from_docstring(docstring)
         docstring = markdown.markdown(docstring)
