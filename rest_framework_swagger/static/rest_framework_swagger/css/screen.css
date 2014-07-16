@@ -1068,3 +1068,7 @@ table {
   text-align: center;
   padding-top: 10px;
 }
+
+.operation .content ul {padding-left: 20px; list-style: circle}
+.operation .content ul li {margin-bottom: 5px;}
+.operation .content ol {padding-left: 20px; list-style: decimal}

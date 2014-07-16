@@ -3,6 +3,7 @@ from abc import ABCMeta, abstractmethod
 import re
 
 from django.contrib.admindocs.utils import trim_docstring
+import markdown
 
 from rest_framework.views import get_view_name, get_view_description
 
@@ -113,15 +114,15 @@ class BaseMethodIntrospector(object):
         docstring = ""
 
         class_docs = trim_docstring(get_view_description(self.callback))
-        method_docs = self.get_docs()
+        method_docs = trim_docstring(self.get_docs())
 
         if class_docs is not None:
             docstring += class_docs
         if method_docs is not None:
             docstring += '\n' + method_docs
 
-        docstring = IntrospectorHelper.strip_params_from_docstring(docstring)
-        docstring = docstring.replace("\n\n", "<br/>")
+        # docstring = IntrospectorHelper.strip_params_from_docstring(docstring)
+        docstring = markdown.markdown(docstring)
 
         return docstring
 
