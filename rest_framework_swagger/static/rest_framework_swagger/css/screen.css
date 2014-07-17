@@ -1069,6 +1069,12 @@ table {
   padding-top: 10px;
 }
 
-.operation .content ul {padding-left: 20px; list-style: circle}
-.operation .content ul li {margin-bottom: 5px;}
+.operation .content code {
+  font-family: "Anonymous Pro", "Menlo", "Consolas", "Bitstream Vera Sans Mono", "Courier New", monospace;
+  background-color: #f0f0f0;
+  color: red;
+  padding: 1px 3px;
+}
+.operation .content ul {margin: 3px 0; padding-left: 20px; list-style: circle}
+.operation .content ul li {margin: 3px 0;}
 .operation .content ol {padding-left: 20px; list-style: decimal}
