@@ -1,6 +1,6 @@
 import datetime
 
-from django.core.urlresolvers import RegexURLResolver
+from django.core.urlresolvers import RegexURLResolver, RegexURLPattern
 from django.conf import settings
 from django.conf.urls import patterns, url, include
 from django.contrib.auth.models import User
@@ -15,11 +15,26 @@ from rest_framework.generics import ListCreateAPIView
 from rest_framework import serializers
 from rest_framework.routers import DefaultRouter
 from rest_framework.viewsets import ModelViewSet
+from rest_framework.decorators import api_view
 
+from .decorators import wrapper_to_func, func_to_wrapper
 from .urlparser import UrlParser
 from .docgenerator import DocumentationGenerator
 from .introspectors import ViewSetIntrospector, APIViewIntrospector, \
+    WrappedAPIViewIntrospector, WrappedAPIViewMethodIntrospector, \
     IntrospectorHelper, APIViewMethodIntrospector
+
+
+def no_markdown(func):
+    def func_sans_markdown(*args, **kwargs):
+        import rest_framework.compat
+        apply_markdown = rest_framework.compat.apply_markdown
+        try:
+            rest_framework.compat.apply_markdown = None
+            func(*args, **kwargs)
+        finally:
+            rest_framework.compat.apply_markdown = apply_markdown
+    return func_sans_markdown
 
 
 class MockApiView(APIView):
@@ -46,9 +61,14 @@ class CommentSerializer(serializers.Serializer):
     created = serializers.DateTimeField(default=datetime.datetime.now)
 
 
+class QuerySerializer(serializers.Serializer):
+    query = serializers.CharField(max_length=100)
+
+
 class UrlParserTest(TestCase):
     def setUp(self):
-        self.url_patterns = patterns('',
+        self.url_patterns = patterns(
+            '',
             url(r'a-view/?$', MockApiView.as_view(), name='a test view'),
             url(r'a-view/child/?$', MockApiView.as_view()),
             url(r'a-view/child2/?$', MockApiView.as_view()),
@@ -96,8 +116,15 @@ class UrlParserTest(TestCase):
 
         self.assertEqual(3, len(apis))
 
+    def test_filter_custom(self):
+        urlparser = UrlParser()
+        apis = [{'path': '/api/custom'}]
+        apis2 = urlparser.get_filtered_apis(apis, 'api/custom')
+        self.assertEqual(apis, apis2)
+
     def test_flatten_url_tree_excluded_namesapce(self):
-        urls = patterns('',
+        urls = patterns(
+            '',
             url(r'api/base/path/', include(self.url_patterns, namespace='exclude'))
         )
         urlparser = UrlParser()
@@ -120,7 +147,8 @@ class UrlParserTest(TestCase):
         router.register(r'more_views', MockApiViewSet)
 
         urls_app = patterns('', url(r'^', include(router.urls)))
-        urls = patterns('',
+        urls = patterns(
+            '',
             url(r'api/', include(urls_app)),
             url(r'test/', include(urls_app))
         )
@@ -138,7 +166,8 @@ class UrlParserTest(TestCase):
 
     def test_get_api_callback_not_rest_view(self):
         urlparser = UrlParser()
-        non_api = patterns('',
+        non_api = patterns(
+            '',
             url(r'something', NonApiView.as_view())
         )
         callback = urlparser.__get_pattern_api_callback__(non_api)
@@ -243,7 +272,8 @@ class NestedUrlParserTest(TestCase):
 
 class DocumentationGeneratorTest(TestCase):
     def setUp(self):
-        self.url_patterns = patterns('',
+        self.url_patterns = patterns(
+            '',
             url(r'a-view/?$', MockApiView.as_view(), name='a test view'),
             url(r'a-view/child/?$', MockApiView.as_view()),
             url(r'a-view/<pk>/?$', MockApiView.as_view(), name="detailed view for mock"),
@@ -264,7 +294,7 @@ class DocumentationGeneratorTest(TestCase):
         docgen = DocumentationGenerator()
         operations = docgen.get_operations(api)
 
-        self.assertEqual('POST', operations[0]['httpMethod'])
+        self.assertEqual('POST', operations[0]['method'])
 
     def test_get_operations_with_no_methods(self):
 
@@ -306,9 +336,23 @@ class DocumentationGeneratorTest(TestCase):
         models = docgen.get_models(apis)
 
         created_prop = models['CommentSerializer']['properties']['created']
-        value = created_prop['allowableValues']['defaultValue']
+        value = created_prop['defaultValue']
         delta = datetime.timedelta(seconds=1)
         self.assertAlmostEqual(value, datetime.datetime.now(), delta=delta)
+
+    def test_get_models_ordering(self):
+        class SerializedAPI(ListCreateAPIView):
+            serializer_class = CommentSerializer
+
+        urlparser = UrlParser()
+        url_patterns = patterns('', url(r'my-api/', SerializedAPI.as_view()))
+        apis = urlparser.get_apis(url_patterns)
+
+        docgen = DocumentationGenerator()
+        models = docgen.get_models(apis)
+
+        self.assertIn('CommentSerializer', models)
+        self.assertEqual(list(models['CommentSerializer']['properties'].keys()), ["email", "content", "created"])
 
     def test_get_serializer_set(self):
         class SerializedAPI(ListCreateAPIView):
@@ -327,7 +371,7 @@ class DocumentationGeneratorTest(TestCase):
         docgen = DocumentationGenerator()
         fields = docgen._get_serializer_fields(CommentSerializer)
 
-        self.assertEqual(3, len(fields))
+        self.assertEqual(3, len(fields['fields']))
 
     def test_get_serializer_fields_api_with_no_serializer(self):
         docgen = DocumentationGenerator()
@@ -338,6 +382,7 @@ class DocumentationGeneratorTest(TestCase):
     def test_get_serializer_class_access_request_context(self):
         class MyListView(ListCreateAPIView):
             serializer_class = CommentSerializer
+
             def get_serializer_class(self):
                 self.serializer_class.context = {'request': self.request}
                 return self.serializer_class
@@ -349,39 +394,50 @@ class DocumentationGeneratorTest(TestCase):
 
         self.assertIs(serializer_class, CommentSerializer)
 
+    def test_nested_serializer(self):
+        class ASerializer(serializers.Serializer):
+            point = CommentSerializer()
+            query = QuerySerializer()
+
+        docgen = DocumentationGenerator()
+        serializerses = docgen._find_field_serializers([ASerializer])
+        self.assertTrue([s for s in serializerses
+                         if isinstance(s, CommentSerializer)])
+        self.assertTrue([s for s in serializerses
+                         if isinstance(s, QuerySerializer)])
+        self.assertFalse([s for s in serializerses
+                         if isinstance(s, ASerializer)])
+
 
 class IntrospectorHelperTest(TestCase):
-    def test_strip_params_from_docstring(self):
+    def test_strip_yaml_from_docstring(self):
         class AnAPIView(APIView):
             """
             My comments are here
-
-            param -- my param
+            ---
+            # This is YAML
+            param: my param
             """
             pass
 
-        docstring = IntrospectorHelper.strip_params_from_docstring(trim_docstring(AnAPIView.__doc__))
+        docstring = IntrospectorHelper.strip_yaml_from_docstring(trim_docstring(AnAPIView.__doc__))
 
-        self.assertEqual("My comments are here<br/>", docstring)
+        self.assertEqual("My comments are here", docstring)
 
     def test_strip_params_from_docstring_multiline(self):
         class TestView(APIView):
             """
             Creates a new user.
             Returns: token - auth token
-
-            email -- e-mail address
-            password -- password, optional
-            city -- city, optional
-            street -- street, optional
-            number -- house number, optional
-            zip_code -- zip code 10 chars, optional
-            phone -- phone number in US format (XXX-XXX-XXXX), optional
+            ---
+            # This is YAML
+            param: my param
+            foo: 123
             """
             pass
 
-        docstring = IntrospectorHelper.strip_params_from_docstring(TestView.__doc__)
-        expected = 'Creates a new user.<br/>Returns: token - auth token<br/>'
+        docstring = IntrospectorHelper.strip_yaml_from_docstring(TestView.__doc__)
+        expected = 'Creates a new user.\nReturns: token - auth token'
 
         self.assertEqual(expected, docstring)
 
@@ -444,6 +500,49 @@ class BaseViewIntrospectorTest(TestCase):
         introspector = APIViewIntrospector(MockApiView, '/', RegexURLResolver(r'^/', ''))
         self.assertEqual(None, introspector.get_serializer_class())
 
+    def test_get_serializer_class_url_kwargs(self):
+        class SerializerFoo(serializers.Serializer):
+            pass
+
+        class SerializerBar(serializers.Serializer):
+            pass
+
+        class TestView(APIView):
+            serializer_class = SerializerFoo
+
+            def get_serializer_class(self):
+                if 'b' in self.kwargs:
+                    return SerializerFoo
+                return SerializerBar
+        introspector = APIViewIntrospector(TestView, '/a', RegexURLPattern(r'^a/$', '', {'b': True}))
+        self.assertEqual(SerializerFoo, introspector.get_serializer_class())
+        introspector = APIViewIntrospector(TestView, '/a', RegexURLPattern(r'^a/$', ''))
+        self.assertEqual(SerializerBar, introspector.get_serializer_class())
+
+        urlparser = UrlParser()
+        url_patterns = patterns(
+            '',
+            url(r'^a/$', TestView.as_view()),
+        )
+        apis = urlparser.get_apis(url_patterns)
+
+        docgen = DocumentationGenerator()
+        serializer_set = docgen._get_serializer_set(apis)
+        self.assertEqual(1, len(serializer_set))
+        self.assertEqual(SerializerBar, list(serializer_set)[0])
+
+        urlparser = UrlParser()
+        url_patterns = patterns(
+            '',
+            url(r'^a/b$', TestView.as_view(), {'b': True}),
+        )
+        apis = urlparser.get_apis(url_patterns)
+
+        docgen = DocumentationGenerator()
+        serializer_set = docgen._get_serializer_set(apis)
+        self.assertEqual(1, len(serializer_set))
+        self.assertEqual(SerializerFoo, list(serializer_set)[0])
+
 
 class BaseMethodIntrospectorTest(TestCase):
     def test_get_method_docs(self):
@@ -455,7 +554,7 @@ class BaseMethodIntrospectorTest(TestCase):
                 """
             pass
 
-        class_introspector = ViewSetIntrospector(TestApiView, '/{pk}', RegexURLResolver(r'^/(?P<{pk}>[^/]+)$', ''))
+        class_introspector = APIViewIntrospector(TestApiView, '/{pk}', RegexURLResolver(r'^/(?P<{pk}>[^/]+)$', ''))
         introspector = APIViewMethodIntrospector(class_introspector, 'GET')
         docs_get = introspector.get_docs()
 
@@ -469,7 +568,7 @@ class BaseMethodIntrospectorTest(TestCase):
             """
             pass
 
-        class_introspector = ViewSetIntrospector(MyListView, '/{pk}', RegexURLResolver(r'^/(?P<{pk}>[^/]+)$', ''))
+        class_introspector = APIViewIntrospector(MyListView, '/{pk}', RegexURLResolver(r'^/(?P<{pk}>[^/]+)$', ''))
         introspector = APIViewMethodIntrospector(class_introspector, 'POST')
         method_docs = introspector.get_summary()
 
@@ -479,7 +578,7 @@ class BaseMethodIntrospectorTest(TestCase):
         class SerializedAPI(ListCreateAPIView):
             serializer_class = CommentSerializer
 
-        class_introspector = ViewSetIntrospector(SerializedAPI, '/', RegexURLResolver(r'^/$', ''))
+        class_introspector = APIViewIntrospector(SerializedAPI, '/', RegexURLResolver(r'^/$', ''))
         introspector = APIViewMethodIntrospector(class_introspector, 'POST')
         params = introspector.build_body_parameters()
 
@@ -489,7 +588,7 @@ class BaseMethodIntrospectorTest(TestCase):
         class SerializedAPI(ListCreateAPIView):
             serializer_class = CommentSerializer
 
-        class_introspector = ViewSetIntrospector(SerializedAPI, '/', RegexURLResolver(r'^/$', ''))
+        class_introspector = APIViewIntrospector(SerializedAPI, '/', RegexURLResolver(r'^/$', ''))
         introspector = APIViewMethodIntrospector(class_introspector, 'POST')
         params = introspector.build_form_parameters()
 
@@ -504,7 +603,7 @@ class BaseMethodIntrospectorTest(TestCase):
         class MyAPIView(ListCreateAPIView):
             serializer_class = MySerializer
 
-        class_introspector = ViewSetIntrospector(MyAPIView, '/', RegexURLResolver(r'^/$', ''))
+        class_introspector = APIViewIntrospector(MyAPIView, '/', RegexURLResolver(r'^/$', ''))
         introspector = APIViewMethodIntrospector(class_introspector, 'POST')
         params = introspector.build_form_parameters()
 
@@ -514,8 +613,6 @@ class BaseMethodIntrospectorTest(TestCase):
         self.assertEqual('content', param['name'])
         self.assertEqual('form', param['paramType'])
         self.assertEqual(True, param['required'])
-        self.assertEqual(200, param['allowableValues']['max'])
-        self.assertEqual(10, param['allowableValues']['min'])
         self.assertEqual('Vandalay Industries', param['defaultValue'])
 
     def test_build_form_parameters_callable_default_value_is_resolved(self):
@@ -526,7 +623,7 @@ class BaseMethodIntrospectorTest(TestCase):
         class MyAPIView(ListCreateAPIView):
             serializer_class = MySerializer
 
-        class_introspector = ViewSetIntrospector(MyAPIView, '/', RegexURLResolver(r'^/$', ''))
+        class_introspector = APIViewIntrospector(MyAPIView, '/', RegexURLResolver(r'^/$', ''))
         introspector = APIViewMethodIntrospector(class_introspector, 'POST')
         params = introspector.build_form_parameters()
 
@@ -537,3 +634,855 @@ class BaseMethodIntrospectorTest(TestCase):
         self.assertEqual('form', param['paramType'])
         self.assertEqual(True, param['required'])
         self.assertEqual(203, param['defaultValue'])
+
+    def test_build_form_parameters_enum_values(self):
+        MY_CHOICES = (
+            ('val1', "Value1"),
+            ('val2', "Value2"),
+            ('val3', "Value3"),
+            ('val4', "Value4")
+        )
+
+        default_value = MY_CHOICES[0][0]
+
+        class MySerializer(serializers.Serializer):
+            choice_default = serializers.ChoiceField(choices=MY_CHOICES, default=default_value)
+            char_field = serializers.CharField()
+
+        class MyAPIView(ListCreateAPIView):
+            serializer_class = MySerializer
+        class_introspector = APIViewIntrospector(MyAPIView, '/', RegexURLResolver(r'^/$', ''))
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        params = introspector.build_form_parameters()
+        self.assertEqual(2, len(params))
+        param = params[0]
+        self.assertEqual(default_value, param['defaultValue'])
+        self.assertEqual(4, len(param['enum']))
+        self.assertEqual([item for item, _ in MY_CHOICES], param['enum'])
+        param = params[1]
+        self.assertFalse(hasattr(param, 'enum'))
+
+
+class YAMLDocstringParserTests(TestCase):
+
+    def test_yaml_loader(self):
+        class AnAPIView(APIView):
+            def get(self):
+                """
+                My comments are here
+                ---
+                # This is YAML
+                param: my param
+                """
+                pass
+
+        class_introspector = APIViewIntrospector(
+            AnAPIView, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'GET')
+        doc_parser = introspector.get_yaml_parser()
+        self.assertEqual(doc_parser.object['param'], 'my param')
+
+    def test_yaml_loader_class_yaml(self):
+        class AnAPIView(APIView):
+            """
+            ---
+            GET:
+                param: my param
+            """
+            def get(self):
+                """
+                My comments are here
+                ---
+                # This is YAML
+                param: your param
+                """
+                pass
+
+        class_introspector = APIViewIntrospector(
+            AnAPIView, '/', RegexURLResolver(r'^/$', '')
+        )
+        class_introspector.methods = lambda: ['GET']
+        introspector = APIViewMethodIntrospector(class_introspector, 'GET')
+        doc_parser = introspector.get_yaml_parser()
+        self.assertEqual(doc_parser.object['param'], 'your param')
+
+    def test_yaml_loader_class_yaml2(self):
+        class AnAPIView(APIView):
+            """
+            ---
+            GET:
+                param: my param
+            """
+            def get(self):
+                """
+                My comments are here
+                ---
+                # This is YAML
+                """
+                pass
+
+        class_introspector = APIViewIntrospector(
+            AnAPIView, '/', RegexURLResolver(r'^/$', '')
+        )
+        class_introspector.methods = lambda: ['GET']
+        introspector = APIViewMethodIntrospector(class_introspector, 'GET')
+        doc_parser = introspector.get_yaml_parser()
+        self.assertEqual(doc_parser.object['param'], 'my param')
+
+    def test_yaml_loader_class_yaml3(self):
+        class MyViewSet(ModelViewSet):
+            """
+            ---
+            GET:
+                param: my param
+            """
+            serializer_class = CommentSerializer
+            model = User
+
+        # Test a list endpoint
+        introspector = ViewSetIntrospector(
+            MyViewSet,
+            '/api/endpoint',
+            url(r'^/api/endpoint$', MyViewSet.as_view({
+                'get': 'list',
+                'post': 'create'
+            }))
+        )
+        allowed_methods = list(introspector)
+        self.assertEqual(2, len(allowed_methods))
+        allowed_methods = [method.get_http_method() for method in allowed_methods]
+        self.assertIn('POST', allowed_methods)
+        self.assertIn('GET', allowed_methods)
+        self.assertIn('list', introspector.methods())
+        self.assertIn('create', introspector.methods())
+        try:
+            introspector = APIViewMethodIntrospector(introspector, 'get')
+            introspector.get_yaml_parser()
+        except Exception as e:
+            self.assertIn('in class docstring are not in view methods', str(e))
+        else:
+            self.assertTrue(False)
+
+    def test_yaml_loader_class_yaml4(self):
+        class MyViewSet(ModelViewSet):
+            """
+            ---
+            list:
+                param: my param
+            """
+            serializer_class = CommentSerializer
+            model = User
+
+        # Test a list endpoint
+        introspector = ViewSetIntrospector(
+            MyViewSet,
+            '/api/endpoint',
+            url(r'^/api/endpoint$', MyViewSet.as_view({
+                'get': 'list',
+                'post': 'create'
+            }))
+        )
+        allowed_methods = list(introspector)
+        self.assertEqual(2, len(allowed_methods))
+        allowed_methods = [method.get_http_method() for method in allowed_methods]
+        self.assertIn('POST', allowed_methods)
+        self.assertIn('GET', allowed_methods)
+        self.assertIn('list', introspector.methods())
+        self.assertIn('create', introspector.methods())
+        introspector = APIViewMethodIntrospector(introspector, 'list')
+        doc_parser = introspector.get_yaml_parser()
+        self.assertEqual(doc_parser.object['param'], 'my param')
+
+    def test_merge_parameters(self):
+        class SerializedAPI(ListCreateAPIView):
+            serializer_class = CommentSerializer
+
+            def post(self, request, *args, **kwargs):
+                """
+                My post view with custom post parameters
+
+                ---
+                parameters:
+                    - name: name
+                      type: string
+                      required: true
+                """
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        parser = introspector.get_yaml_parser()
+        params = parser.discover_parameters(introspector)
+
+        self.assertEqual(len(CommentSerializer().get_fields()) + 1, len(params))
+
+    def test_replace_parameters(self):
+        class SerializedAPI(ListCreateAPIView):
+            serializer_class = CommentSerializer
+
+            def post(self, request, *args, **kwargs):
+                """
+                My post view with custom post parameters
+
+                ---
+                parameters_strategy: replace
+                parameters:
+                    - name: name
+                      type: string
+                      required: true
+                """
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        parser = introspector.get_yaml_parser()
+        params = parser.discover_parameters(introspector)
+
+        self.assertEqual(1, len(params))
+
+    def test_omit_parameters(self):
+        class SerializedAPI(ListCreateAPIView):
+            serializer_class = CommentSerializer
+
+            def post(self, request, *args, **kwargs):
+                """
+                My post view with custom post parameters
+
+                ---
+                omit_parameters:
+                    - form
+                parameters:
+                    - name: name
+                      type: string
+                      required: true
+                """
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        parser = introspector.get_yaml_parser()
+        params = parser.discover_parameters(introspector)
+
+        self.assertEqual(0, len(params))
+
+    def test_complex_parameters_strategy(self):
+        class SerializedAPI(ListCreateAPIView):
+            serializer_class = CommentSerializer
+
+            def get(self, request, *args, **kwargs):
+                """
+                My list view with custom query parameters
+
+                ---
+                parameters_strategy:
+                    form: replace
+                    query: merge
+                parameters:
+                    - name: search
+                      type: string
+                      required: true
+                      paramType: query
+                    - name: foo
+                      paramType: form
+                """
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'GET')
+        parser = introspector.get_yaml_parser()
+        params = introspector.build_form_parameters()
+        self.assertEqual(len(CommentSerializer().get_fields()), len(params))
+
+        params = parser.discover_parameters(introspector)
+        self.assertEqual(2, len(params))
+        query_params = parser._filter_params(params, 'paramType', 'query')
+        form_params = parser._filter_params(params, 'paramType', 'form')
+        self.assertEqual(1, len(list(query_params)))
+        self.assertEqual(1, len(list(form_params)))
+
+    def test_parameters_minimum_is_string(self):
+        '''
+        minimum and maximum of Parameter Object required by Swagger 1.2 spec to be string.
+        '''
+        class SerializedAPI(ListCreateAPIView):
+            serializer_class = CommentSerializer
+
+            def post(self, request, *args, **kwargs):
+                """
+                My post view with custom post parameters
+
+                ---
+                parameters_strategy:
+                    form: replace
+                    query: replace
+                parameters:
+                    - name: name
+                      type: integer
+                      required: true
+                      minimum: 1
+                      maximum: 100
+                """
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        parser = introspector.get_yaml_parser()
+        params = parser.discover_parameters(introspector)
+        self.assertEqual(len(params), 1)
+        self.assertIn('minimum', params[0])
+        self.assertEqual(params[0]['minimum'], '1')
+        self.assertIn('maximum', params[0])
+        self.assertEqual(params[0]['maximum'], '100')
+
+    def test_response_messages(self):
+        class SerializedAPI(ListCreateAPIView):
+            serializer_class = CommentSerializer
+
+            def post(self, request, *args, **kwargs):
+                """
+                ---
+                responseMessages:
+                    - code: 403
+                      message: Not authorized.
+                    - code: 404
+                      message: Not found.
+                """
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        parser = introspector.get_yaml_parser()
+        messages = parser.get_response_messages()
+
+        self.assertEqual(2, len(messages))
+        self.assertEqual(messages[0]['message'], 'Not authorized.')
+        self.assertEqual(messages[1]['message'], 'Not found.')
+
+    def test_custom_serializer(self):
+        class SerializedAPI(ListCreateAPIView):
+            serializer_class = CommentSerializer
+
+            def post(self, request, *args, **kwargs):
+                """
+                ---
+                serializer: serializers.Serializer
+                """
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        self.assertTrue(serializer, serializers.Serializer)
+
+        DocumentationGenerator.explicit_serializers.clear()
+
+    def test_fbv_custom_serializer_explicit(self):
+
+        @api_view(['POST'])
+        def SerializedAPI2(request):
+            """
+            ---
+            serializer: rest_framework_swagger.tests.CommentSerializer
+            """
+            return "blarg"
+
+        class_introspector = WrappedAPIViewIntrospector(
+            func_to_wrapper(SerializedAPI2), '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = WrappedAPIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        self.assertEqual(serializer, CommentSerializer)
+
+    def test_fbv_custom_serializer_relative1(self):
+
+        @api_view(['POST'])
+        def SerializedAPI2(request):
+            """
+            ---
+            serializer: ..tests.CommentSerializer
+            """
+            return "blarg"
+
+        class_introspector = WrappedAPIViewIntrospector(
+            SerializedAPI2.cls, '/', RegexURLResolver(r'^/$', '')
+        )
+        wrapper_to_func(SerializedAPI2.cls)
+        introspector = WrappedAPIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        self.assertEqual(serializer, CommentSerializer)
+
+    def test_fbv_custom_serializer(self):
+
+        @api_view(['POST'])
+        def SerializedAPI2(request):
+            """
+            ---
+            serializer: CommentSerializer
+            """
+            return "blarg"
+
+        class_introspector = WrappedAPIViewIntrospector(
+            SerializedAPI2.cls, '/', RegexURLResolver(r'^/$', '')
+        )
+        wrapper_to_func(SerializedAPI2.cls)
+        introspector = WrappedAPIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        self.assertEqual(serializer, CommentSerializer)
+
+    def test_fbv_custom_serializer_noisy_fail(self):
+
+        @api_view(['POST'])
+        def SerializedAPI2(request):
+            """
+            ---
+            serializer: HonkSerializer
+            """
+            return "blarg"
+
+        class_introspector = WrappedAPIViewIntrospector(
+            SerializedAPI2.cls, '/', RegexURLResolver(r'^/$', '')
+        )
+        wrapper_to_func(SerializedAPI2.cls)
+        introspector = WrappedAPIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        try:
+            generator._get_method_serializer(introspector)
+        except Exception as e:
+            self.assertTrue("Could not find HonkSerializer" in str(e))
+        else:
+            self.assertTrue(False)
+
+    def test_omit_serializer(self):
+        class SerializedAPI(ListCreateAPIView):
+            serializer_class = CommentSerializer
+
+            def post(self, request, *args, **kwargs):
+                """
+                ---
+                omit_serializer: true
+                """
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        self.assertEqual(serializer, None)
+
+    def test_request_response_serializers1(self):
+        class SerializedAPI(ListCreateAPIView):
+            serializer_class = CommentSerializer
+
+            def post(self, request, *args, **kwargs):
+                """
+                ---
+                request_serializer: QuerySerializer
+                response_serializer: CommentSerializer
+                """
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        url_patterns = patterns('', url(r'my-api/', SerializedAPI.as_view()))
+        urlparser = UrlParser()
+        apis = urlparser.get_apis(url_patterns)
+        models = generator.get_models(apis)
+        self.assertIn('SerializedAPIPostResponse', models)
+        self.assertIn('WriteCommentSerializer', models)
+        self.assertIn('CommentSerializer', models)
+        self.assertNotIn('QuerySerializer', models)
+        self.assertNotIn('WriteQuerySerializer', models)
+        self.assertEqual(serializer, CommentSerializer)
+        body_parameters = introspector.build_body_parameters()
+        form_parameters = introspector.build_form_parameters()
+        self.assertEqual(body_parameters['name'], "QuerySerializer")
+        self.assertEqual(len(form_parameters), 1)
+        self.assertEqual(form_parameters[0]['name'], "query")
+
+    def test_request_response_serializers2(self):
+        class SerializedAPI(ListCreateAPIView):
+            serializer_class = CommentSerializer
+
+            def post(self, request, *args, **kwargs):
+                """
+                ---
+                serializer: QuerySerializer
+                response_serializer: CommentSerializer
+                """
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        self.assertEqual(serializer, CommentSerializer)
+        body_parameters = introspector.build_body_parameters()
+        form_parameters = introspector.build_form_parameters()
+        self.assertEqual(body_parameters['name'], "QuerySerializer")
+        self.assertEqual(len(form_parameters), 1)
+        self.assertEqual(form_parameters[0]['name'], "query")
+
+    def test_request_response_serializers3(self):
+        class SerializedAPI(ListCreateAPIView):
+            serializer_class = CommentSerializer
+
+            def post(self, request, *args, **kwargs):
+                """
+                ---
+                request_serializer: QuerySerializer
+                serializer: CommentSerializer
+                """
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        self.assertEqual(serializer, CommentSerializer)
+        body_parameters = introspector.build_body_parameters()
+        form_parameters = introspector.build_form_parameters()
+        self.assertEqual(body_parameters['name'], "QuerySerializer")
+        self.assertEqual(len(form_parameters), 1)
+        self.assertEqual(form_parameters[0]['name'], "query")
+
+    def test_request_response_serializers4(self):
+        class SerializedAPI(ListCreateAPIView):
+            serializer_class = CommentSerializer
+
+            def post(self, request, *args, **kwargs):
+                """
+                ---
+                request_serializer: QuerySerializer
+                """
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        self.assertEqual(serializer, CommentSerializer)
+        body_parameters = introspector.build_body_parameters()
+        form_parameters = introspector.build_form_parameters()
+        self.assertEqual(body_parameters['name'], "QuerySerializer")
+        self.assertEqual(len(form_parameters), 1)
+        self.assertEqual(form_parameters[0]['name'], "query")
+
+    def test_request_response_serializers5(self):
+        class SerializedAPI(ListCreateAPIView):
+            serializer_class = QuerySerializer
+
+            def post(self, request, *args, **kwargs):
+                """
+                ---
+                response_serializer: CommentSerializer
+                """
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        self.assertEqual(serializer, CommentSerializer)
+        body_parameters = introspector.build_body_parameters()
+        form_parameters = introspector.build_form_parameters()
+        self.assertEqual(body_parameters['name'], "QuerySerializer")
+        self.assertEqual(len(form_parameters), 1)
+        self.assertEqual(form_parameters[0]['name'], "query")
+
+    def test_request_response_serializers5_1(self):
+        class SerializedAPI(ListCreateAPIView):
+            """
+                ---
+                POST:
+                    request_serializer: QuerySerializer
+                    response_serializer: CommentSerializer
+            """
+            serializer_class = QuerySerializer
+
+            def post(self, request, *args, **kwargs):
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        self.assertEqual(serializer, CommentSerializer)
+        body_parameters = introspector.build_body_parameters()
+        form_parameters = introspector.build_form_parameters()
+        self.assertEqual(body_parameters['name'], "QuerySerializer")
+        self.assertEqual(len(form_parameters), 1)
+        self.assertEqual(form_parameters[0]['name'], "query")
+
+    def test_request_response_serializers6(self):
+        class SerializedAPI(ListCreateAPIView):
+            """
+                ---
+                POST:
+                    serializer: QuerySerializer
+                    response_serializer: CommentSerializer
+            """
+            serializer_class = QuerySerializer
+
+            def post(self, request, *args, **kwargs):
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        self.assertEqual(serializer, CommentSerializer)
+        body_parameters = introspector.build_body_parameters()
+        form_parameters = introspector.build_form_parameters()
+        self.assertEqual(body_parameters['name'], "QuerySerializer")
+        self.assertEqual(len(form_parameters), 1)
+        self.assertEqual(form_parameters[0]['name'], "query")
+
+    def test_request_response_serializers7(self):
+        class SerializedAPI(ListCreateAPIView):
+            """
+                ---
+                POST:
+                    request_serializer: QuerySerializer
+                    serializer: CommentSerializer
+            """
+            serializer_class = QuerySerializer
+
+            def post(self, request, *args, **kwargs):
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        self.assertEqual(serializer, CommentSerializer)
+        body_parameters = introspector.build_body_parameters()
+        form_parameters = introspector.build_form_parameters()
+        self.assertEqual(body_parameters['name'], "QuerySerializer")
+        self.assertEqual(len(form_parameters), 1)
+        self.assertEqual(form_parameters[0]['name'], "query")
+
+    def test_request_response_serializers8(self):
+        class SerializedAPI(ListCreateAPIView):
+            """
+                ---
+                POST:
+                    request_serializer: QuerySerializer
+            """
+            serializer_class = CommentSerializer
+
+            def post(self, request, *args, **kwargs):
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        self.assertEqual(serializer, CommentSerializer)
+        body_parameters = introspector.build_body_parameters()
+        form_parameters = introspector.build_form_parameters()
+        self.assertEqual(body_parameters['name'], "QuerySerializer")
+        self.assertEqual(len(form_parameters), 1)
+        self.assertEqual(form_parameters[0]['name'], "query")
+
+    def test_request_response_serializers9(self):
+        class SerializedAPI(ListCreateAPIView):
+            """
+                ---
+                POST:
+                    response_serializer: CommentSerializer
+            """
+            serializer_class = QuerySerializer
+
+            def post(self, request, *args, **kwargs):
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        self.assertEqual(serializer, CommentSerializer)
+        body_parameters = introspector.build_body_parameters()
+        form_parameters = introspector.build_form_parameters()
+        self.assertEqual(body_parameters['name'], "QuerySerializer")
+        self.assertEqual(len(form_parameters), 1)
+        self.assertEqual(form_parameters[0]['name'], "query")
+
+    def test_request_response_serializers10(self):
+        class SerializedAPI(ListCreateAPIView):
+            """
+                ---
+                POST:
+                    request_serializer: CommentSerializer
+                    response_serializer: QuerySerializer
+            """
+            serializer_class = QuerySerializer
+
+            def post(self, request, *args, **kwargs):
+                """
+                    ---
+                    request_serializer: QuerySerializer
+                    response_serializer: CommentSerializer
+                """
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        self.assertEqual(serializer, CommentSerializer)
+        body_parameters = introspector.build_body_parameters()
+        form_parameters = introspector.build_form_parameters()
+        self.assertEqual(body_parameters['name'], "QuerySerializer")
+        self.assertEqual(len(form_parameters), 1)
+        self.assertEqual(form_parameters[0]['name'], "query")
+
+    def test_custom_response_class(self):
+        class SerializedAPI(ListCreateAPIView):
+            serializer_class = CommentSerializer
+
+            def post(self, request, *args, **kwargs):
+                """
+                ---
+                type:
+                  name:
+                    required: true
+                    type: string
+                  url:
+                    required: false
+                    type: url
+                """
+                return super(SerializedAPI, self).post(request, *args, **kwargs)
+
+        class_introspector = APIViewIntrospector(
+            SerializedAPI, '/', RegexURLResolver(r'^/$', '')
+        )
+        introspector = APIViewMethodIntrospector(class_introspector, 'POST')
+        parser = introspector.get_yaml_parser()
+        generator = DocumentationGenerator()
+        serializer = generator._get_method_serializer(introspector)
+        response_class = generator._get_method_response_type(
+            parser, serializer, class_introspector, introspector)
+
+        self.assertEqual(response_class, 'SerializedAPIPostResponse')
+        self.assertEqual(serializer, None)
+        self.assertIn('SerializedAPIPostResponse',
+                      generator.explicit_response_types)
+
+    @no_markdown
+    def test_fbv_notes(self):
+
+        @api_view(["POST"])
+        def a_view(request):
+            """
+            Slimy toads
+            """
+            return "blarg"
+
+        class_introspector = WrappedAPIViewIntrospector(
+            func_to_wrapper(a_view), '/', RegexURLResolver(r'^/$', '')
+        )
+
+        notes = class_introspector.get_notes()
+        self.assertEqual(notes, "Slimy toads")
+        introspector = WrappedAPIViewMethodIntrospector(class_introspector, 'POST')
+
+        notes = introspector.get_notes()
+
+        self.assertEqual(notes, "Slimy toads")
+
+    def test_fbv_markdown(self):
+
+        @api_view(["POST"])
+        def a_view(request):
+            """
+            Slimy *toads*
+            """
+            return "blarg"
+
+        class_introspector = WrappedAPIViewIntrospector(
+            func_to_wrapper(a_view), '/', RegexURLResolver(r'^/$', '')
+        )
+
+        url_patterns = patterns('', url(r'my-api/', a_view))
+        urlparser = UrlParser()
+        generator = DocumentationGenerator()
+        apis = urlparser.get_apis(url_patterns)
+        notes = class_introspector.get_notes()
+        self.assertEqual(notes, "<p>Slimy <em>toads</em></p>")
+        introspector = WrappedAPIViewMethodIntrospector(class_introspector, 'POST')
+
+        notes = introspector.get_notes()
+
+        self.assertEqual(notes, "<p>Slimy <em>toads</em></p>")
+        api_docs = generator.generate(apis)
+        self.assertEqual(len(api_docs), 1)
+        self.assertIn("description", api_docs[0])
+        self.assertEqual(api_docs[0]["description"], "Slimy toads")
+        self.assertIn('operations', api_docs[0])
+        self.assertEqual(api_docs[0]["operations"][0]['summary'], "Slimy toads")
+
+    def test_apiview_models(self):
+        from rest_framework.views import Response
+
+        class MyCustomView(APIView):
+            """
+            Slimy toads
+            """
+
+            def get(self, *args, **kwargs):
+                """
+                param1 -- my param
+                """
+                return Response({'foo': 'bar'})
+
+            def post(self, request, *args, **kwargs):
+                """
+                horse -- the name of your horse
+                """
+                return Response({'horse': request.GET.get('horse')})
+
+        url_patterns = patterns('', url(r'my-api/', MyCustomView.as_view()))
+        urlparser = UrlParser()
+        apis = urlparser.get_apis(url_patterns)
+        generator = DocumentationGenerator()
+        models = generator.get_models(apis)
+        self.assertEqual(type(models), dict)

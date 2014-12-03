@@ -1,13 +1,17 @@
-VERSION = '0.1.14'
+VERSION = '0.2.1'
 
 DEFAULT_SWAGGER_SETTINGS = {
     'exclude_namespaces': [],
     'api_version': '',
     'api_path': '/',
     'api_key': '',
+    'token_type': 'Token',
     'enabled_methods': ['get', 'post', 'put', 'patch', 'delete'],
     'is_authenticated': False,
-    'is_superuser': False
+    'is_superuser': False,
+    'permission_denied_handler': None,
+    'template_path': 'rest_framework_swagger/index.html',
+    'doc_expansion': 'none',
 }
 
 try:
